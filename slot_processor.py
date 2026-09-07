@@ -78,7 +78,7 @@ def merge_results(results):
 
 class SlotProcessor:
     def __init__(self, camera, classifier, plc, image_saver, stats,
-                 shot1_events, shot2_events):
+                 shot1_events, shot2_events, slot_gen):
         self.camera = camera
         self.classifier = classifier
         self.plc = plc
@@ -87,6 +87,14 @@ class SlotProcessor:
         # threading.Event per slot — app.py set khi thấy coil M12x/M12(x+4) ON
         self.shot1_events = shot1_events
         self.shot2_events = shot2_events
+        # app.py tăng gen mỗi lần spawn slot — thread chỉ được ghi PLC
+        # khi gen của nó vẫn là chủ sở hữu hiện tại của slot.
+        self.slot_gen = slot_gen
+
+    def _owns(self, slot_idx, gen):
+        """Slot vẫn thuộc object của thread này? Slot đã bị quả mới chiếm
+        (app.py spawn lại) -> thread cũ phải hủy, KHÔNG trigger/ACK/ghi PLC."""
+        return self.slot_gen[slot_idx] == gen
 
     # ------------------------------------------------------------------
     def _wait_shot(self, ev, slot_idx, obj_id, label):
@@ -112,7 +120,7 @@ class SlotProcessor:
             )
         return got
 
-    def _shoot_and_ack(self, ev, slot_idx, obj_id, label, ack_coil):
+    def _shoot_and_ack(self, ev, slot_idx, obj_id, label, ack_coil, gen):
         """Chờ event -> trigger camera -> ACK PLC ngay sau capture.
 
         ACK TRƯỚC inference: PLC cần ACK để chốt shot complete và phát event
@@ -121,10 +129,23 @@ class SlotProcessor:
         """
         if not self._wait_shot(ev, slot_idx, obj_id, label):
             return None, None
+        if not self._owns(slot_idx, gen):
+            logger.warning(
+                f"  [Slot{slot_idx}] {label}: slot đã bị quả mới chiếm"
+                " — hủy, không trigger/ACK"
+            )
+            return None, None
 
         t_trig = time.time()
         img = self.camera.capture()          # gửi TriggerSoftware + GetFrame
         trig_ms = (time.time() - t_trig) * 1000
+
+        if not self._owns(slot_idx, gen):
+            logger.warning(
+                f"  [Slot{slot_idx}] {label}: mất slot trong lúc capture"
+                f" ({trig_ms:.0f}ms) — bỏ ảnh, không ACK"
+            )
+            return None, trig_ms
 
         # ACK về PLC ngay lập tức
         self.plc.write_coil(ack_coil, True)
@@ -143,8 +164,14 @@ class SlotProcessor:
         return img, trig_ms
 
     # ------------------------------------------------------------------
-    def process(self, slot_idx, obj_id):
-        """Xử lý 1 object theo encoder shot events."""
+    def process(self, slot_idx, obj_id, gen):
+        """Xử lý 1 object theo encoder shot events.
+
+        gen = số thứ tự lượt spawn của slot này (app.py cấp). Mọi hành động
+        ghi PLC đều check _owns(slot_idx, gen) — nếu app.py đã spawn lượt
+        mới (quả khác chiếm slot), thread cũ tự hủy để không ghi kết quả
+        cũ / ACK xóa request của quả mới. PLC tự dọn latch qua rung release.
+        """
         try:
             t_start = time.time()
             images = []
@@ -155,10 +182,21 @@ class SlotProcessor:
             ack1 = Config.SHOT1_ACK_COILS[slot_idx]
             ack2 = Config.SHOT2_ACK_COILS[slot_idx]
 
+            # Xóa giá trị cũ của quả trước (kết quả không phải lúc nào cũng
+            # được ghi — nhánh abort dưới đây bỏ qua ghi) để tránh để lại
+            # size/decision treo trong PLC.
+            self.plc.write_register(Config.SIZE_REGS[slot_idx], 0)
+            self.plc.write_register(Config.DECISION_REGS[slot_idx], 0)
+
             # ---- SHOT 1: chờ event encoder -> software trigger -> capture ----
             img1, _ = self._shoot_and_ack(
-                shot1_ev, slot_idx, obj_id, "Shot1", ack1
+                shot1_ev, slot_idx, obj_id, "Shot1", ack1, gen
             )
+            if not self._owns(slot_idx, gen):
+                logger.warning(
+                    f"  [Slot{slot_idx}] ABORT sau shot1: slot thuộc quả mới"
+                )
+                return
 
             skip_shot2 = False
             if img1 is None:
@@ -201,15 +239,21 @@ class SlotProcessor:
                 # giải phóng handshake. Chờ ngắn, không log timeout.
                 shot2_ev.clear()
                 if shot2_ev.wait(timeout=Config.SHOT_EVENT_TIMEOUT_S):
-                    self.plc.write_coil(ack2, True)
-                    logger.info(
-                        f"  [Slot{slot_idx}] Shot2 event: ACK không chụp"
-                        " (skip)"
-                    )
+                    if self._owns(slot_idx, gen):
+                        self.plc.write_coil(ack2, True)
+                        logger.info(
+                            f"  [Slot{slot_idx}] Shot2 event: ACK không chụp"
+                            " (skip)"
+                        )
             else:
                 img2, _ = self._shoot_and_ack(
-                    shot2_ev, slot_idx, obj_id, "Shot2", ack2
+                    shot2_ev, slot_idx, obj_id, "Shot2", ack2, gen
                 )
+                if not self._owns(slot_idx, gen):
+                    logger.warning(
+                        f"  [Slot{slot_idx}] ABORT sau shot2: slot thuộc quả mới"
+                    )
+                    return
                 if img2 is not None:
                     t_inf = time.time()
                     res2 = self.classifier.classify(img2)
@@ -227,6 +271,16 @@ class SlotProcessor:
                         )
 
             # ---- Kết quả -> PLC ----
+            # Check cuối: nếu slot đã bị quả mới chiếm trong lúc inference,
+            # KHÔNG ghi size/decision/Mx2/Mx1 — mọi giá trị này thuộc về
+            # object cũ, ghi xuống sẽ làm xếp loại nhầm quả mới.
+            if not self._owns(slot_idx, gen):
+                logger.warning(
+                    f"  [Slot{slot_idx}] ABORT trước khi ghi kết quả:"
+                    " slot thuộc quả mới — bỏ kết quả cũ"
+                )
+                return
+
             has_detection = any(r[3] is not None for r in results)
             size_final, good_final = 0, False
 
@@ -286,10 +340,13 @@ class SlotProcessor:
 
         except Exception as e:
             logger.error(f"[Slot{slot_idx}] Error: {e}", exc_info=True)
-            # Chống treo: ACK cả 2 shot + object để PLC không latch vĩnh viễn
-            try:
-                self.plc.write_coil(Config.SHOT1_ACK_COILS[slot_idx], True)
-                self.plc.write_coil(Config.SHOT2_ACK_COILS[slot_idx], True)
-                self.plc.write_coil(Config.ACK_COILS[slot_idx], True)
-            except Exception:
-                pass
+            # Chống treo: ACK cả 2 shot + object để PLC không latch vĩnh viễn.
+            # CHỈ khi slot vẫn thuộc object này — nếu quả mới đã chiếm, ACK
+            # sẽ xóa nhầm request/event của nó. PLC tự dọn qua rung release.
+            if self._owns(slot_idx, gen):
+                try:
+                    self.plc.write_coil(Config.SHOT1_ACK_COILS[slot_idx], True)
+                    self.plc.write_coil(Config.SHOT2_ACK_COILS[slot_idx], True)
+                    self.plc.write_coil(Config.ACK_COILS[slot_idx], True)
+                except Exception:
+                    pass

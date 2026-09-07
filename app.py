@@ -55,10 +55,15 @@ class SizeSortingApp:
         self.shot1_events = [threading.Event() for _ in range(Config.NUM_SLOTS)]
         self.shot2_events = [threading.Event() for _ in range(Config.NUM_SLOTS)]
 
+        # Generation per slot — tăng mỗi lần spawn. Thread slot chỉ được ghi
+        # PLC khi gen của nó vẫn là chủ hiện tại (chống race khi quả mới chiếm
+        # slot lúc thread cũ còn chờ event).
+        self.slot_gen = [0] * Config.NUM_SLOTS
+
         self.processor = SlotProcessor(
             self.camera, self.classifier, self.plc,
             self.image_saver, self.stats,
-            self.shot1_events, self.shot2_events,
+            self.shot1_events, self.shot2_events, self.slot_gen,
         )
         self.running = False
         self._active_threads = {}   # slot_idx -> Thread
@@ -148,9 +153,12 @@ class SizeSortingApp:
         # Dọn event tồn dư trước khi thread mới wait
         self.shot1_events[slot_idx].clear()
         self.shot2_events[slot_idx].clear()
+        # Cấp generation mới -> mọi thread cũ của slot này tự hủy khi ghi PLC
+        self.slot_gen[slot_idx] += 1
+        gen = self.slot_gen[slot_idx]
         t = threading.Thread(
             target=self.processor.process,
-            args=(slot_idx, obj_id),
+            args=(slot_idx, obj_id, gen),
             daemon=True,
             name=f"Slot{slot_idx}",
         )
@@ -208,9 +216,26 @@ class SizeSortingApp:
                             slot_state[i] = ST_PROCESSING
 
                     elif slot_state[i] == ST_PROCESSING:
-                        # Thread đã gửi ACK trước khi kết thúc. Khi nó chết
-                        # -> chờ PLC clear trigger trước khi nhận vật mới.
-                        if not thread_alive:
+                        if obj_now != last_objid[i]:
+                            # PLC đã cấp quả MỚI vào slot trong lúc thread cũ
+                            # còn đang chờ event (thread cũ > chu kỳ băng tải).
+                            # Thu hồi ownership: tăng gen + đánh thức event để
+                            # thread cũ tỉnh và tự hủy ở check _owns kế tiếp —
+                            # nếu không nó sẽ ghi kết quả quả cũ + ACK M11 xóa
+                            # nhầm request của quả mới.
+                            self.slot_gen[i] += 1
+                            self.shot1_events[i].set()
+                            self.shot2_events[i].set()
+                            logger.warning(
+                                f"[Slot{i}] PLC cap qua khac (ObjID"
+                                f" {last_objid[i]}->{obj_now}) trong luc thread"
+                                f" cu chay — thu hoi ownership"
+                            )
+                            slot_state[i] = ST_WAIT_CLEAR
+                            wait_since[i] = time.time()
+                        elif not thread_alive:
+                            # Thread đã gửi ACK trước khi kết thúc. Khi nó chết
+                            # -> chờ PLC clear trigger trước khi nhận vật mới.
                             slot_state[i] = ST_WAIT_CLEAR
                             wait_since[i] = time.time()
 
