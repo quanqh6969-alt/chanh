@@ -1,0 +1,23 @@
+# Cài trên máy CÓ GPU NVIDIA — dùng file này THAY cho requirements.txt
+# Điều kiện: driver NVIDIA + CUDA 12.x + cuDNN 9 đã cài.
+#
+#   python -m venv .venv
+#   .venv\Scripts\activate
+#   pip install -r requirements-gpu.txt
+#
+# KHÔNG cài lẫn onnxruntime thường — nếu đã lỡ cài thì:
+#   pip uninstall onnxruntime -y  trước khi cài file này.
+
+ultralytics==8.4.9
+onnxruntime-gpu==1.24.4
+opencv-python==4.13.0.92
+numpy==2.4.4
+pymodbus==3.13.0
+pyserial==3.5
+
+# Chỉ cần khi tự export best.pt -> best.onnx (repo đã kèm best.onnx).
+# QUAN TRỌNG: torch bản CUDA — KHÔNG phải bản +cpu mặc định của pip.
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.9.1
+onnx==1.22.0
+onnxslim==0.1.96

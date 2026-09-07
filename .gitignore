@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Log & output runtime
+logs/
+*.log
+captured_images/
+test_capture.jpg
+
+# Model tạm do ultralytics sinh ra khi export
+best.torchscript
+*_openvino_model/
+*.engine
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
